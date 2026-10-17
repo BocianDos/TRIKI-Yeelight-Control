@@ -54,12 +54,18 @@ class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private val netPool = Executors.newCachedThreadPool()
 
-    // Pełna mapa UUID dla kapsla TRIKI (CAP001 / HopX)
+    // UUID profilu GATT dla kapsla TRIKI (CAP001)
     private val uuidService = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
-    private val uuidRx = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")  // Komendy do kapsla (Start IMU)
-    private val uuidTx = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")  // Strumień Notify IMU (ramki 0x22)
-    private val uuidLed = UUID.fromString("6e400004-b5a3-f393-e0a9-e50e24dcca9e") // Kanał 4: Dioda LED (0x01 / 0x00)
+    private val uuidRx = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")  // Zapis: inicjalizacja IMU
+    private val uuidTx = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")  // Odczyt Notify: ramki 0x22
+    private val uuidLed = UUID.fromString("6e400004-b5a3-f393-e0a9-e50e24dcca9e") // Zapis (response=True): LED
     private val uuidCccd = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    // Oficjalna sekwencja startowa wzbudzająca strumień IMU w kapslu Triki
+    private val TRIKI_PRE_INIT = byteArrayOf(0x01, 0x00)
+    private val TRIKI_START_FRAME = byteArrayOf(
+        0x20, 0x10, 0x00, 0xD0.toByte(), 0x07, 0x34, 0x00, 0x03
+    )
 
     private var gatt: BluetoothGatt? = null
     private var rxChar: BluetoothGattCharacteristic? = null
@@ -68,12 +74,18 @@ class MainActivity : Activity() {
 
     private var bleConnected = false
     private var scanningBle = false
-    private var rxPacketCount = 0L
+    @Volatile private var rxPacketCount = 0L
     private var ledManualState = false
 
-    // Szeregowa kolejka operacji BLE GATT (zapobiega gubieniu pakietów przez Androida)
+    // Bezpieczna kolejka GATT (dedykowany timeout nie kasuje innych timerów UI!)
     private val gattQueue = ConcurrentLinkedQueue<() -> Unit>()
     @Volatile private var gattBusy = false
+    private val gattTimeoutRunnable = Runnable {
+        if (gattBusy) {
+            gattBusy = false
+            processNextGattOp()
+        }
+    }
 
     // Stan fizyki kapsla i gestów
     private var btnPressed = false
@@ -82,7 +94,11 @@ class MainActivity : Activity() {
     private var clickCounter = 0
 
     private var gyroBiasZ = 0f
-    private var biasSamples = 0
+    private var gravityRef = 2048f // Przy ±16g (0x0010) 1G ~= 2048 LSB
+    private var uprightSign = 1f
+    private var calibSamples = 0
+    private var accelFirstLayout = true // true: [2..7]=Accel, [8..13]=Gyro (wg specyfikacji Triki)
+    private var upsideDownFrames = 0
     private var upsideDownLatched = false
     private var lastFlipTs = 0L
     private var lastNetSendTs = 0L
@@ -279,7 +295,7 @@ class MainActivity : Activity() {
     }
 
     // =========================================================================
-    // SZEREGOWA KOLEJKA BLE GATT + AUTOMATYCZNY UNLOCKER STRUMIENIA IMU
+    // SZEREGOWA KOLEJKA BLE GATT + RAMKA STARTOWA 0x20 0x10 0x00 0xD0 0x07 0x34 0x00 0x03
     // =========================================================================
     private fun enqueueGattOp(op: () -> Unit) {
         gattQueue.add(op)
@@ -295,33 +311,35 @@ class MainActivity : Activity() {
             return
         }
         gattBusy = true
+        ui.removeCallbacks(gattTimeoutRunnable)
+        ui.postDelayed(gattTimeoutRunnable, 450)
         runCatching { next.invoke() }.onFailure {
-            gattBusy = false
-            processNextGattOp()
+            markGattOpDone()
         }
-        // Bezpiecznik czasowy, gdyby stos BLE Androida nie wywołał callbacku
-        ui.postDelayed({
-            if (gattBusy) {
-                gattBusy = false
-                processNextGattOp()
-            }
-        }, 350)
     }
 
     private fun markGattOpDone() {
-        ui.removeCallbacksAndMessages(null)
+        ui.removeCallbacks(gattTimeoutRunnable)
         gattBusy = false
         processNextGattOp()
     }
 
-    private fun writeCharQueued(c: BluetoothGattCharacteristic?, payload: ByteArray) {
+    private fun writeCharQueued(
+        c: BluetoothGattCharacteristic?,
+        payload: ByteArray,
+        forceResponse: Boolean = true
+    ) {
         val g = gatt ?: return
         val target = c ?: return
         enqueueGattOp {
-            target.writeType = if ((target.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            val props = target.properties
+            target.writeType = when {
+                forceResponse && (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0 ->
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 ->
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                else ->
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             }
             target.value = payload
             val ok = g.writeCharacteristic(target)
@@ -335,11 +353,7 @@ class MainActivity : Activity() {
             g.setCharacteristicNotification(c, true)
             val desc = c.getDescriptor(uuidCccd)
             if (desc != null) {
-                desc.value = if ((c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
-                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                } else {
-                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                }
+                desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 val ok = g.writeDescriptor(desc)
                 if (!ok) markGattOpDone()
             } else {
@@ -400,12 +414,14 @@ class MainActivity : Activity() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 bleConnected = true
                 rxPacketCount = 0L
+                calibSamples = 0
                 gyroBiasZ = 0f
-                biasSamples = 0
+                upsideDownFrames = 0
+                upsideDownLatched = false
                 gattQueue.clear()
                 gattBusy = false
                 updateTopStatus()
-                log("[BLE] Połączono! Pobieram tablicę usług GATT...")
+                log("[BLE] Połączono! Konfiguruję profil GATT...")
                 g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -413,36 +429,51 @@ class MainActivity : Activity() {
                 gattQueue.clear()
                 gattBusy = false
                 updateTopStatus()
-                log("[BLE] Kapsel rozłączony (uśpiony).")
+                log("[BLE] Kapsel rozłączony (poszedł spać).")
             }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            rxChar = null; txChar = null; ledChar = null
-
-            val foundUuids = mutableListOf<String>()
-            for (srv in g.services) {
-                for (c in srv.characteristics) {
-                    val shortId = c.uuid.toString().substring(0, 8)
-                    foundUuids.add(shortId)
-                    when (c.uuid) {
-                        uuidRx -> rxChar = c
-                        uuidTx -> txChar = c
-                        uuidLed -> ledChar = c
-                    }
-                    // Subskrybujemy wszystkie charakterystyki NOTIFY/INDICATE po kolei w kolejce
-                    if ((c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE)) != 0) {
-                        enableNotifyQueued(c)
+            val nus = g.getService(uuidService)
+            if (nus != null) {
+                rxChar = nus.getCharacteristic(uuidRx)
+                txChar = nus.getCharacteristic(uuidTx)
+                ledChar = nus.getCharacteristic(uuidLed)
+            } else {
+                for (srv in g.services) {
+                    for (c in srv.characteristics) {
+                        when (c.uuid) {
+                            uuidRx -> rxChar = c
+                            uuidTx -> txChar = c
+                            uuidLed -> ledChar = c
+                        }
                     }
                 }
             }
 
-            log("[GATT] Kanały: ${foundUuids.joinToString(",")}\nAktywuję strumień IMU i diodę LED...")
+            // 1. Włącz subskrypcję powiadomień na kanale TX (6e400003)
+            txChar?.let { enableNotifyQueued(it) }
 
-            // Po włączeniu subskrypcji CCCD: mignij diodą na kanale 6e400004 i wystartuj strumień IMU na 6e400002
+            // 2. Wyślij sekwencję inicjalizującą na kanał RX (6e400002):
+            //    Najpierw 0x01, 0x00, a potem 8-bajtowa ramka startowa:
+            //    0x20, 0x10, 0x00, 0xD0, 0x07, 0x34, 0x00, 0x03
+            writeCharQueued(rxChar, TRIKI_PRE_INIT, forceResponse = true)
+            writeCharQueued(rxChar, TRIKI_START_FRAME, forceResponse = true)
+
+            // 3. Mignij diodą na kanale LED (6e400004, response=True) na znak gotowości
             setCapLed(true)
-            ui.postDelayed({ setCapLed(false) }, 220)
-            ui.postDelayed({ startImuStreamSequence() }, 350)
+            ui.postDelayed({ setCapLed(false) }, 250)
+
+            // 4. Fallback po 900ms: jeśli kapsel wolał WRITE_TYPE_NO_RESPONSE na RX, ponów ramkę startową
+            ui.postDelayed({
+                if (bleConnected && rxPacketCount == 0L) {
+                    log("[BLE] Ponawiam ramkę startową 0x20 (No-Response)...")
+                    writeCharQueued(rxChar, TRIKI_PRE_INIT, forceResponse = false)
+                    writeCharQueued(rxChar, TRIKI_START_FRAME, forceResponse = false)
+                }
+            }, 900)
+
+            log("[GATT] Wysłano ramkę startową 0x20 10 00 D0 07 34 00 03 -> czekam na pakiety 0x22...")
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -453,41 +484,29 @@ class MainActivity : Activity() {
             markGattOpDone()
         }
 
+        // Callback dla Android 13 / 14 / 15 / 16 (API 33+)
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            c: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            processImuFrame(value)
+        }
+
+        // Callback dla starszych wersji Androida (API 26-32)
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-            val raw = c.value ?: return
-            processImuFrame(raw)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                val raw = c.value ?: return
+                processImuFrame(raw)
+            }
         }
     }
 
-    // Sekwencja wybudzająca strumień 98Hz na charakterystyce 6e400002
-    private fun startImuStreamSequence() {
-        if (!bleConnected) return
-        val rx = rxChar ?: return
-
-        // Lista kandydatów komendy aktywującej strumień czujników w różnych rewizjach FW Triki
-        val initPayloads = listOf(
-            byteArrayOf(0x01),
-            byteArrayOf(0x22, 0x01),
-            byteArrayOf(0x22),
-            byteArrayOf(0x01, 0x01),
-            byteArrayOf(0x20, 0x01),
-            byteArrayOf(0x10, 0x01),
-            byteArrayOf(0x02)
-        )
-
-        Thread {
-            for (cmd in initPayloads) {
-                if (!bleConnected || rxPacketCount > 0) break
-                writeCharQueued(rx, cmd)
-                Thread.sleep(180)
-            }
-        }.start()
-    }
-
     private fun setCapLed(turnOn: Boolean) {
-        val target = ledChar ?: rxChar ?: return
-        writeCharQueued(target, byteArrayOf(if (turnOn) 0x01 else 0x00))
+        val target = ledChar ?: return
+        // Ważne wg dokumentacji Triki: LED wymaga potwierdzenia zapisu (response=True / WRITE_TYPE_DEFAULT)
+        writeCharQueued(target, byteArrayOf(if (turnOn) 0x01 else 0x00), forceResponse = true)
     }
 
     private fun testCapLed() {
@@ -497,7 +516,12 @@ class MainActivity : Activity() {
         }
         ledManualState = !ledManualState
         setCapLed(ledManualState)
-        log("[LED] Wysłano ${if (ledManualState) "0x01 (WŁĄCZ)" else "0x00 (WYŁĄCZ)"} na kanał 6e400004")
+        // Przy okazji wyślij ponownie ramkę startową, gdyby kapsel wcześniej jej nie złapał
+        if (rxPacketCount == 0L) {
+            writeCharQueued(rxChar, TRIKI_PRE_INIT, forceResponse = true)
+            writeCharQueued(rxChar, TRIKI_START_FRAME, forceResponse = true)
+        }
+        log("[LED] Dioda: ${if (ledManualState) "ON" else "OFF"} | Odebrane pakiety IMU: $rxPacketCount")
     }
 
     private fun pulseTrikiLed(blinks: Int) {
@@ -514,7 +538,11 @@ class MainActivity : Activity() {
 
     // =========================================================================
     // PARSER RAMEK 0x22 Z KAPSLA TRIKI + GESTY
-    // Specyfikacja: data[0] = 0x22, data[1] = Przycisk (0/1), data[2..13] = 6x int16 LE
+    // Format wg dokumentacji:
+    // data[0] = 0x22
+    // data[1] = Przycisk (0 = puszczony, 1 = wciśnięty)
+    // data[2..7] = Tilt X, Tilt Y, Flip Z (int16 LE)
+    // data[8..13] = Spin X, Spin Y, Turn Z (int16 LE)
     // =========================================================================
     private val clickResolver = Runnable {
         if (clickCounter == 1) {
@@ -537,7 +565,7 @@ class MainActivity : Activity() {
         if (pressed && !btnPressed) {
             rotatedDuringPress = false
             longPressFired = false
-            setCapLed(true) // Zapal diodę w kapslu, dopóki trzymasz przycisk
+            setCapLed(true) // Świeć diodą, dopóki trzymasz guzik
             ui.postDelayed(longPressResolver, 650)
         } else if (!pressed && btnPressed) {
             setCapLed(false)
@@ -553,96 +581,119 @@ class MainActivity : Activity() {
 
     private fun processImuFrame(data: ByteArray) {
         rxPacketCount++
-        val hex = data.joinToString(" ") { "%02X".format(it) }
 
-        if (data.size == 1) {
-            val pressed = (data[0].toInt() and 0x01) != 0
-            handleButtonEdge(pressed)
-            log("[PKT #$rxPacketCount] BTN: $pressed | HEX: $hex")
+        if (data.size < 14) {
+            if (data.isNotEmpty()) {
+                val hexShort = data.joinToString(" ") { "%02X".format(it) }
+                log("[PKT #$rxPacketCount] (${data.size}B) HEX: $hexShort")
+            }
             return
         }
 
-        if (data.size >= 14) {
-            val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val pressed = (data[1].toInt() and 0x01) == 1
+        ui.post { handleButtonEdge(pressed) }
 
-            // Zgodnie z dokumentacją Triki:
-            // data[0] == 0x22 (nagłówek)
-            // data[1] == przycisk (0 = puszczony, 1 = wciśnięty)
-            // data[2..13] == 6 x int16 Little Endian (gx, gy, gz, ax, ay, az)
-            val isStandard0x22 = (data[0] == 0x22.toByte()) && (data[1].toInt() == 0 || data[1].toInt() == 1)
-            val imuOffset = if (isStandard0x22) 2 else 0
-            val pressed = if (isStandard0x22) {
-                data[1].toInt() == 1
-            } else {
-                (data.last().toInt() and 0x01) == 1
+        // Odczytujemy wszystkie 6 wartości int16 z bajtów 2..13
+        val v0 = buf.getShort(2).toInt()
+        val v1 = buf.getShort(4).toInt()
+        val v2 = buf.getShort(6).toInt()
+        val v3 = buf.getShort(8).toInt()
+        val v4 = buf.getShort(10).toInt()
+        val v5 = buf.getShort(12).toInt()
+
+        // Autokalibracja w pierwszych 25 próbkach: sprawdzamy, która trójka trzyma wektor grawitacji 1G (~2048)
+        if (calibSamples < 25) {
+            val magFirst = sqrt((v0 * v0 + v1 * v1 + v2 * v2).toDouble()).toFloat()
+            val magSecond = sqrt((v3 * v3 + v4 * v4 + v5 * v5).toDouble()).toFloat()
+
+            // Trójka ze stałym wektorem grawitacji 1G to Akcelerometr, a trójka bliska 0 w spoczynku to Żyroskop
+            if (magFirst > 800f && magSecond < 600f) {
+                accelFirstLayout = true
+                gravityRef = (gravityRef * calibSamples + magFirst) / (calibSamples + 1)
+                if (abs(v2) > 500) uprightSign = sign(v2.toFloat())
+                gyroBiasZ = (gyroBiasZ * calibSamples + v5) / (calibSamples + 1)
+                calibSamples++
+            } else if (magSecond > 800f && magFirst < 600f) {
+                accelFirstLayout = false
+                gravityRef = (gravityRef * calibSamples + magSecond) / (calibSamples + 1)
+                if (abs(v5) > 500) uprightSign = sign(v5.toFloat())
+                gyroBiasZ = (gyroBiasZ * calibSamples + v2) / (calibSamples + 1)
+                calibSamples++
             }
+        }
 
-            handleButtonEdge(pressed)
+        val ax = if (accelFirstLayout) v0 else v3
+        val ay = if (accelFirstLayout) v1 else v4
+        val az = if (accelFirstLayout) v2 else v5
+        val gx = if (accelFirstLayout) v3 else v0
+        val gy = if (accelFirstLayout) v4 else v1
+        val gzRaw = if (accelFirstLayout) v5 else v2
 
-            val gx = buf.getShort(imuOffset).toInt()
-            val gy = buf.getShort(imuOffset + 2).toInt()
-            val gzRaw = buf.getShort(imuOffset + 4).toInt()
-            val ax = buf.getShort(imuOffset + 6).toInt()
-            val ay = buf.getShort(imuOffset + 8).toInt()
-            val az = buf.getShort(imuOffset + 10).toInt()
+        val gz = (gzRaw - gyroBiasZ).toInt()
 
-            // Autokalibracja spoczynkowa osi Z żyroskopu
-            if (abs(gzRaw) < 120 && abs(gx) < 120 && abs(gy) < 120 && biasSamples < 50) {
-                gyroBiasZ = (gyroBiasZ * biasSamples + gzRaw) / (biasSamples + 1)
-                biasSamples++
-            }
-            val gz = (gzRaw - gyroBiasZ).toInt()
+        // 1. Odwrócenie kapsla na plecy (wektor Z przeciwny do pozycji normalnej przez ~150 ms)
+        val orientedAz = az * uprightSign
+        val flipThreshold = -(gravityRef * 0.58f)
+        val now = SystemClock.elapsedRealtime()
 
-            // 1. Odwrócenie kapsla na plecy (oś Z grawitacji ujemna) -> Wyłącz wszystkie lampy
-            val now = SystemClock.elapsedRealtime()
-            if (az < -10500) {
-                if (!upsideDownLatched && now - lastFlipTs > 2500) {
-                    upsideDownLatched = true
-                    lastFlipTs = now
-                    ui.post {
-                        hudView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        killAllLamps()
-                    }
-                }
-            } else if (az > 6500) {
-                upsideDownLatched = false
-            }
-
-            // 2. Obrót w osi Z -> ściemnianie lub zmiana temperatury bieli
-            val deadzone = 130
-            if (abs(gz) > deadzone && lamps.isNotEmpty()) {
-                val targets = activeLampList()
-                val primary = targets.first()
-
-                val norm = (abs(gz) - deadzone).toFloat()
-                val accelStep = (norm.pow(1.15f) * 0.0020f * sensitivityMultiplier) * sign(gz.toFloat())
-
-                if (pressed) {
-                    // TRZYMANY GUZIK + OBRÓT = Temperatura barwowa (2700K - 6500K)
-                    rotatedDuringPress = true
-                    ui.removeCallbacks(longPressResolver)
-
-                    val newCt = (primary.ct + (accelStep * 38f).toInt()).coerceIn(2700, 6500)
-                    if (newCt != primary.ct) {
-                        targets.forEach { it.ct = newCt; it.nightMode = false; it.isOn = true }
-                        throttledNetworkPush(newCt, isCt = true, targets = targets)
-                    }
-                } else {
-                    // SAM OBRÓT = Jasność (1% - 100%)
-                    val newBright = (primary.bright + accelStep).coerceIn(1.0, 100.0)
-                    targets.forEach { it.bright = newBright; it.isOn = true }
-                    throttledNetworkPush(newBright.roundToInt(), isCt = false, targets = targets)
-                }
-            }
-
-            if (rxPacketCount % 8L == 0L || pressed) {
+        if (orientedAz < flipThreshold) {
+            upsideDownFrames++
+            if (upsideDownFrames >= 14 && !upsideDownLatched && now - lastFlipTs > 2500) {
+                upsideDownLatched = true
+                lastFlipTs = now
                 ui.post {
-                    hudView.updateImuTelemetry(ax / 16384f, ay / 16384f, az / 16384f, gz, pressed, upsideDownLatched)
-                    logBox.text = "[PKT #$rxPacketCount] BTN:${if (pressed) "1" else "0"} GZ:$gz AZ:$az\nHEX: $hex"
+                    hudView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    killAllLamps()
                 }
             }
-        } else {
-            log("[PKT #$rxPacketCount] (${data.size}B) HEX: $hex")
+        } else if (orientedAz > gravityRef * 0.35f) {
+            upsideDownFrames = 0
+            upsideDownLatched = false
+        }
+
+        // 2. Obrót w osi Z (turn_z) -> ściemnianie lub zmiana temperatury bieli
+        // Przy skali ±2000 dps (0x07D0), 1 deg/s ~= 16.4 LSB, więc próg 55 LSB to ok. 3.3 deg/s
+        val deadzone = 55
+        if (abs(gz) > deadzone && lamps.isNotEmpty()) {
+            val targets = activeLampList()
+            val primary = targets.first()
+
+            val norm = (abs(gz) - deadzone).toFloat()
+            // Kierunek obrotu: kręcenie w prawo zwiększa wartość, w lewo zmniejsza
+            val accelStep = (norm.pow(1.12f) * 0.0024f * sensitivityMultiplier) * (-sign(gz.toFloat()))
+
+            if (pressed) {
+                // TRZYMANY GUZIK + OBRÓT = Temperatura barwowa (2700K - 6500K)
+                rotatedDuringPress = true
+                ui.removeCallbacks(longPressResolver)
+
+                val newCt = (primary.ct + (accelStep * 38f).toInt()).coerceIn(2700, 6500)
+                if (newCt != primary.ct) {
+                    targets.forEach { it.ct = newCt; it.nightMode = false; it.isOn = true }
+                    throttledNetworkPush(newCt, isCt = true, targets = targets)
+                }
+            } else {
+                // SAM OBRÓT = Jasność (1% - 100%)
+                val newBright = (primary.bright + accelStep).coerceIn(1.0, 100.0)
+                targets.forEach { it.bright = newBright; it.isOn = true }
+                throttledNetworkPush(newBright.roundToInt(), isCt = false, targets = targets)
+            }
+        }
+
+        if (rxPacketCount % 6L == 0L || pressed) {
+            val normScale = gravityRef.coerceAtLeast(1000f)
+            ui.post {
+                hudView.updateImuTelemetry(
+                    ax / normScale,
+                    ay / normScale,
+                    orientedAz / normScale,
+                    gz,
+                    pressed,
+                    upsideDownLatched
+                )
+                logBox.text = "[PKT #$rxPacketCount] BTN:${if (pressed) "1" else "0"} | TURN_Z:$gz | FLIP_Z:$az (1G≈${gravityRef.toInt()})\nRAW: [$v0, $v1, $v2] | [$v3, $v4, $v5]"
+            }
         }
     }
 
@@ -1204,7 +1255,7 @@ class MainActivity : Activity() {
 
             paintText.color = 0xFF4C5B70.toInt()
             paintText.textSize = radius * 0.075f
-            canvas.drawText("GYRO Z: $imuGz  |  DOTKNIJ: ON/OFF  |  PRZYTRZYMAJ: NOCNY", cx, height - 10f, paintText)
+            canvas.drawText("TURN Z: $imuGz  |  DOTKNIJ: ON/OFF  |  PRZYTRZYMAJ: NOCNY", cx, height - 10f, paintText)
         }
 
         private fun interpolateCtColor(t: Float): Int {
