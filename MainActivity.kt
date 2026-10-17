@@ -24,6 +24,7 @@ import java.net.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -47,22 +48,32 @@ data class LampNode(
 class MainActivity : Activity() {
 
     private val lamps = CopyOnWriteArrayList<LampNode>()
-    private var selectedIdx = 0 // lamps.size == tryb grupowy (WSZYSTKIE)
+    private var selectedIdx = 0 // lamps.size == WSZYSTKIE
 
     private lateinit var prefs: SharedPreferences
     private val ui = Handler(Looper.getMainLooper())
     private val netPool = Executors.newCachedThreadPool()
 
-    // BLE / NUS UUIDs (nRF52810 w kapslu CAP001)
+    // Pełna mapa UUID dla kapsla TRIKI (CAP001 / HopX)
     private val uuidService = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
-    private val uuidRx = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
-    private val uuidTx = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+    private val uuidRx = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")  // Komendy do kapsla (Start IMU)
+    private val uuidTx = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")  // Strumień Notify IMU (ramki 0x22)
+    private val uuidLed = UUID.fromString("6e400004-b5a3-f393-e0a9-e50e24dcca9e") // Kanał 4: Dioda LED (0x01 / 0x00)
     private val uuidCccd = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     private var gatt: BluetoothGatt? = null
     private var rxChar: BluetoothGattCharacteristic? = null
+    private var txChar: BluetoothGattCharacteristic? = null
+    private var ledChar: BluetoothGattCharacteristic? = null
+
     private var bleConnected = false
     private var scanningBle = false
+    private var rxPacketCount = 0L
+    private var ledManualState = false
+
+    // Szeregowa kolejka operacji BLE GATT (zapobiega gubieniu pakietów przez Androida)
+    private val gattQueue = ConcurrentLinkedQueue<() -> Unit>()
+    @Volatile private var gattBusy = false
 
     // Stan fizyki kapsla i gestów
     private var btnPressed = false
@@ -101,12 +112,12 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-         runCatching { gatt?.close() }
+        runCatching { gatt?.close() }
         netPool.shutdownNow()
     }
 
     // =========================================================================
-    // BUDOWANIE INTERFEJSU (Czysty kod, styl Industrial / Cyberpunk)
+    // BUDOWANIE INTERFEJSU
     // =========================================================================
     private fun buildLayout() {
         val root = LinearLayout(this).apply {
@@ -115,7 +126,6 @@ class MainActivity : Activity() {
             setPadding(16.dp, 12.dp, 16.dp, 12.dp)
         }
 
-        // Górny pasek: Tytuł + status BLE + przyciski skanowania
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -127,13 +137,13 @@ class MainActivity : Activity() {
         }
         val appTitle = TextView(this).apply {
             text = "TRIKI // CONTROL DECK"
-            textSize = 18f
+            textSize = 17f
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             setTextColor(0xFF00F5D4.toInt())
         }
         statusBadge = TextView(this).apply {
-            text = "BLE: ROZŁĄCZONY  •  LAN: SKANOWANIE..."
-            textSize = 11f
+            text = "BLE: ROZŁĄCZONY  •  LAN: SKAN..."
+            textSize = 10.5f
             typeface = Typeface.MONOSPACE
             setTextColor(0xFF8A99AD.toInt())
         }
@@ -141,18 +151,20 @@ class MainActivity : Activity() {
         titleCol.addView(statusBadge)
 
         val btnBle = makeActionPill("⚡ TRIKI", 0xFF00BBF9.toInt()) { toggleBleConnection() }
+        val btnLed = makeActionPill("💡 LED", 0xFFFFBE0B.toInt()) { testCapLed() }
         val btnLan = makeActionPill("📡 LAN", 0xFF00F5D4.toInt()) { scanLanForLamps() }
 
         topBar.addView(titleCol)
         topBar.addView(btnBle)
-        topBar.addView(Space(this).apply { layoutParams = LinearLayout.LayoutParams(8.dp, 1) })
+        topBar.addView(Space(this).apply { layoutParams = LinearLayout.LayoutParams(6.dp, 1) })
+        topBar.addView(btnLed)
+        topBar.addView(Space(this).apply { layoutParams = LinearLayout.LayoutParams(6.dp, 1) })
         topBar.addView(btnLan)
         root.addView(topBar)
 
-        // Pasek wyboru lamp (Horizontal Scroll)
         val chipScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
-            setPadding(0, 12.dp, 0, 8.dp)
+            setPadding(0, 10.dp, 0, 6.dp)
         }
         chipContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -161,11 +173,8 @@ class MainActivity : Activity() {
         chipScroll.addView(chipContainer)
         root.addView(chipScroll)
 
-        // Centralny wektorowy HUD (Pokrętło + Żyroskop + Dotyk)
         hudView = TrikiHudView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-            )
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
             onDialChanged = { newBright, newCt, isCtEdit ->
                 applyManualDialChange(newBright, newCt, isCtEdit)
             }
@@ -174,7 +183,6 @@ class MainActivity : Activity() {
         }
         root.addView(hudView)
 
-        // Szybkie sceny (Presety)
         val scenesRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -195,7 +203,7 @@ class MainActivity : Activity() {
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 setTextColor(Color.WHITE)
                 gravity = Gravity.CENTER
-                setPadding(10.dp, 8.dp, 10.dp, 8.dp)
+                setPadding(8.dp, 8.dp, 8.dp, 8.dp)
                 background = roundRect(accent, 10.dp, if (i == 4) 0xFFFF0055.toInt() else 0xFF3E4C63.toInt())
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     if (i > 0) leftMargin = 6.dp
@@ -209,11 +217,10 @@ class MainActivity : Activity() {
         }
         root.addView(scenesRow)
 
-        // Pasek czułości żyroskopu
         val sensRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(8.dp, 4.dp, 8.dp, 4.dp)
+            setPadding(8.dp, 2.dp, 8.dp, 2.dp)
         }
         val sensLabel = TextView(this).apply {
             text = "CZUŁOŚĆ KAPSLA: ${(sensitivityMultiplier * 100).toInt()}%"
@@ -222,7 +229,7 @@ class MainActivity : Activity() {
             setTextColor(0xFF8A99AD.toInt())
         }
         val seek = SeekBar(this).apply {
-            max = 250
+            max = 300
             progress = (sensitivityMultiplier * 100).toInt()
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -240,15 +247,15 @@ class MainActivity : Activity() {
         sensRow.addView(seek)
         root.addView(sensRow)
 
-        // Konsola diagnostyczna na dole
         logBox = TextView(this).apply {
-            text = "[SYS] Gotowy. Przytrzymaj nazwę lampy, aby zmienić jej nazwę."
-            textSize = 10.5f
+            text = "[SYS] Gotowy. Kliknij 'Ż' na kapslu i naciśnij ⚡ TRIKI."
+            textSize = 10f
             typeface = Typeface.MONOSPACE
-            setTextColor(0xFF6C7D93.toInt())
+            setTextColor(0xFF00F5D4.toInt())
             background = roundRect(0xFF11161F.toInt(), 8.dp, 0xFF1E2736.toInt())
             setPadding(10.dp, 8.dp, 10.dp, 8.dp)
-            maxLines = 2
+            minLines = 2
+            maxLines = 3
         }
         root.addView(logBox)
 
@@ -259,11 +266,11 @@ class MainActivity : Activity() {
     private fun makeActionPill(label: String, strokeColor: Int, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             text = label
-            textSize = 12f
+            textSize = 11.5f
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             setTextColor(Color.WHITE)
-            setPadding(12.dp, 7.dp, 12.dp, 7.dp)
-            background = roundRect(0xFF161E2B.toInt(), 18.dp, strokeColor)
+            setPadding(10.dp, 7.dp, 10.dp, 7.dp)
+            background = roundRect(0xFF161E2B.toInt(), 16.dp, strokeColor)
             setOnClickListener {
                 it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                 onClick()
@@ -271,12 +278,383 @@ class MainActivity : Activity() {
         }
     }
 
+    // =========================================================================
+    // SZEREGOWA KOLEJKA BLE GATT + AUTOMATYCZNY UNLOCKER STRUMIENIA IMU
+    // =========================================================================
+    private fun enqueueGattOp(op: () -> Unit) {
+        gattQueue.add(op)
+        if (!gattBusy) {
+            processNextGattOp()
+        }
+    }
+
+    private fun processNextGattOp() {
+        val next = gattQueue.poll()
+        if (next == null) {
+            gattBusy = false
+            return
+        }
+        gattBusy = true
+        runCatching { next.invoke() }.onFailure {
+            gattBusy = false
+            processNextGattOp()
+        }
+        // Bezpiecznik czasowy, gdyby stos BLE Androida nie wywołał callbacku
+        ui.postDelayed({
+            if (gattBusy) {
+                gattBusy = false
+                processNextGattOp()
+            }
+        }, 350)
+    }
+
+    private fun markGattOpDone() {
+        ui.removeCallbacksAndMessages(null)
+        gattBusy = false
+        processNextGattOp()
+    }
+
+    private fun writeCharQueued(c: BluetoothGattCharacteristic?, payload: ByteArray) {
+        val g = gatt ?: return
+        val target = c ?: return
+        enqueueGattOp {
+            target.writeType = if ((target.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            } else {
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            }
+            target.value = payload
+            val ok = g.writeCharacteristic(target)
+            if (!ok) markGattOpDone()
+        }
+    }
+
+    private fun enableNotifyQueued(c: BluetoothGattCharacteristic) {
+        val g = gatt ?: return
+        enqueueGattOp {
+            g.setCharacteristicNotification(c, true)
+            val desc = c.getDescriptor(uuidCccd)
+            if (desc != null) {
+                desc.value = if ((c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                }
+                val ok = g.writeDescriptor(desc)
+                if (!ok) markGattOpDone()
+            } else {
+                markGattOpDone()
+            }
+        }
+    }
+
+    private fun toggleBleConnection() {
+        if (bleConnected) {
+            runCatching { gatt?.disconnect(); gatt?.close() }
+            bleConnected = false
+            gattQueue.clear()
+            gattBusy = false
+            updateTopStatus()
+            log("[BLE] Rozłączono z kapslem.")
+            return
+        }
+        startBleScan()
+    }
+
+    private fun startBleScan() {
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        if (adapter == null || !adapter.isEnabled) {
+            log("[BLE] Włącz Bluetooth w telefonie!")
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner ?: return
+        if (scanningBle) return
+        scanningBle = true
+        log("[BLE] Szukam TRIKI... Kliknij guzik 'Ż' na kapslu!")
+        updateTopStatus()
+
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val devName = result.device.name ?: result.scanRecord?.deviceName ?: ""
+                if (devName.contains("TRIKI", ignoreCase = true) || devName.contains("CAP", ignoreCase = true)) {
+                    scanningBle = false
+                    runCatching { scanner.stopScan(this) }
+                    log("[BLE] Znaleziono $devName (${result.device.address}). Łączę...")
+                    gatt = result.device.connectGatt(this@MainActivity, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                }
+            }
+        }
+        scanner.startScan(callback)
+        ui.postDelayed({
+            if (scanningBle) {
+                scanningBle = false
+                runCatching { scanner.stopScan(callback) }
+                updateTopStatus()
+                log("[BLE] Nie wykryto kapsla. Kliknij 'Ż' i spróbuj ponownie.")
+            }
+        }, 8000)
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                bleConnected = true
+                rxPacketCount = 0L
+                gyroBiasZ = 0f
+                biasSamples = 0
+                gattQueue.clear()
+                gattBusy = false
+                updateTopStatus()
+                log("[BLE] Połączono! Pobieram tablicę usług GATT...")
+                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                g.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                bleConnected = false
+                gattQueue.clear()
+                gattBusy = false
+                updateTopStatus()
+                log("[BLE] Kapsel rozłączony (uśpiony).")
+            }
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            rxChar = null; txChar = null; ledChar = null
+
+            val foundUuids = mutableListOf<String>()
+            for (srv in g.services) {
+                for (c in srv.characteristics) {
+                    val shortId = c.uuid.toString().substring(0, 8)
+                    foundUuids.add(shortId)
+                    when (c.uuid) {
+                        uuidRx -> rxChar = c
+                        uuidTx -> txChar = c
+                        uuidLed -> ledChar = c
+                    }
+                    // Subskrybujemy wszystkie charakterystyki NOTIFY/INDICATE po kolei w kolejce
+                    if ((c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE)) != 0) {
+                        enableNotifyQueued(c)
+                    }
+                }
+            }
+
+            log("[GATT] Kanały: ${foundUuids.joinToString(",")}\nAktywuję strumień IMU i diodę LED...")
+
+            // Po włączeniu subskrypcji CCCD: mignij diodą na kanale 6e400004 i wystartuj strumień IMU na 6e400002
+            setCapLed(true)
+            ui.postDelayed({ setCapLed(false) }, 220)
+            ui.postDelayed({ startImuStreamSequence() }, 350)
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            markGattOpDone()
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            markGattOpDone()
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            val raw = c.value ?: return
+            processImuFrame(raw)
+        }
+    }
+
+    // Sekwencja wybudzająca strumień 98Hz na charakterystyce 6e400002
+    private fun startImuStreamSequence() {
+        if (!bleConnected) return
+        val rx = rxChar ?: return
+
+        // Lista kandydatów komendy aktywującej strumień czujników w różnych rewizjach FW Triki
+        val initPayloads = listOf(
+            byteArrayOf(0x01),
+            byteArrayOf(0x22, 0x01),
+            byteArrayOf(0x22),
+            byteArrayOf(0x01, 0x01),
+            byteArrayOf(0x20, 0x01),
+            byteArrayOf(0x10, 0x01),
+            byteArrayOf(0x02)
+        )
+
+        Thread {
+            for (cmd in initPayloads) {
+                if (!bleConnected || rxPacketCount > 0) break
+                writeCharQueued(rx, cmd)
+                Thread.sleep(180)
+            }
+        }.start()
+    }
+
+    private fun setCapLed(turnOn: Boolean) {
+        val target = ledChar ?: rxChar ?: return
+        writeCharQueued(target, byteArrayOf(if (turnOn) 0x01 else 0x00))
+    }
+
+    private fun testCapLed() {
+        if (!bleConnected) {
+            log("[LED] Najpierw połącz kapsel przyciskiem ⚡ TRIKI!")
+            return
+        }
+        ledManualState = !ledManualState
+        setCapLed(ledManualState)
+        log("[LED] Wysłano ${if (ledManualState) "0x01 (WŁĄCZ)" else "0x00 (WYŁĄCZ)"} na kanał 6e400004")
+    }
+
+    private fun pulseTrikiLed(blinks: Int) {
+        if (!bleConnected || ledChar == null) return
+        netPool.execute {
+            repeat(blinks) {
+                setCapLed(true)
+                Thread.sleep(110)
+                setCapLed(false)
+                Thread.sleep(110)
+            }
+        }
+    }
+
+    // =========================================================================
+    // PARSER RAMEK 0x22 Z KAPSLA TRIKI + GESTY
+    // Specyfikacja: data[0] = 0x22, data[1] = Przycisk (0/1), data[2..13] = 6x int16 LE
+    // =========================================================================
+    private val clickResolver = Runnable {
+        if (clickCounter == 1) {
+            cycleTargetLamp()
+        } else if (clickCounter >= 2) {
+            toggleActivePower()
+        }
+        clickCounter = 0
+    }
+
+    private val longPressResolver = Runnable {
+        if (btnPressed && !rotatedDuringPress) {
+            longPressFired = true
+            hudView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            toggleActiveNightMode()
+        }
+    }
+
+    private fun handleButtonEdge(pressed: Boolean) {
+        if (pressed && !btnPressed) {
+            rotatedDuringPress = false
+            longPressFired = false
+            setCapLed(true) // Zapal diodę w kapslu, dopóki trzymasz przycisk
+            ui.postDelayed(longPressResolver, 650)
+        } else if (!pressed && btnPressed) {
+            setCapLed(false)
+            ui.removeCallbacks(longPressResolver)
+            if (!rotatedDuringPress && !longPressFired) {
+                clickCounter++
+                ui.removeCallbacks(clickResolver)
+                ui.postDelayed(clickResolver, 280)
+            }
+        }
+        btnPressed = pressed
+    }
+
+    private fun processImuFrame(data: ByteArray) {
+        rxPacketCount++
+        val hex = data.joinToString(" ") { "%02X".format(it) }
+
+        if (data.size == 1) {
+            val pressed = (data[0].toInt() and 0x01) != 0
+            handleButtonEdge(pressed)
+            log("[PKT #$rxPacketCount] BTN: $pressed | HEX: $hex")
+            return
+        }
+
+        if (data.size >= 14) {
+            val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+
+            // Zgodnie z dokumentacją Triki:
+            // data[0] == 0x22 (nagłówek)
+            // data[1] == przycisk (0 = puszczony, 1 = wciśnięty)
+            // data[2..13] == 6 x int16 Little Endian (gx, gy, gz, ax, ay, az)
+            val isStandard0x22 = (data[0] == 0x22.toByte()) && (data[1].toInt() == 0 || data[1].toInt() == 1)
+            val imuOffset = if (isStandard0x22) 2 else 0
+            val pressed = if (isStandard0x22) {
+                data[1].toInt() == 1
+            } else {
+                (data.last().toInt() and 0x01) == 1
+            }
+
+            handleButtonEdge(pressed)
+
+            val gx = buf.getShort(imuOffset).toInt()
+            val gy = buf.getShort(imuOffset + 2).toInt()
+            val gzRaw = buf.getShort(imuOffset + 4).toInt()
+            val ax = buf.getShort(imuOffset + 6).toInt()
+            val ay = buf.getShort(imuOffset + 8).toInt()
+            val az = buf.getShort(imuOffset + 10).toInt()
+
+            // Autokalibracja spoczynkowa osi Z żyroskopu
+            if (abs(gzRaw) < 120 && abs(gx) < 120 && abs(gy) < 120 && biasSamples < 50) {
+                gyroBiasZ = (gyroBiasZ * biasSamples + gzRaw) / (biasSamples + 1)
+                biasSamples++
+            }
+            val gz = (gzRaw - gyroBiasZ).toInt()
+
+            // 1. Odwrócenie kapsla na plecy (oś Z grawitacji ujemna) -> Wyłącz wszystkie lampy
+            val now = SystemClock.elapsedRealtime()
+            if (az < -10500) {
+                if (!upsideDownLatched && now - lastFlipTs > 2500) {
+                    upsideDownLatched = true
+                    lastFlipTs = now
+                    ui.post {
+                        hudView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        killAllLamps()
+                    }
+                }
+            } else if (az > 6500) {
+                upsideDownLatched = false
+            }
+
+            // 2. Obrót w osi Z -> ściemnianie lub zmiana temperatury bieli
+            val deadzone = 130
+            if (abs(gz) > deadzone && lamps.isNotEmpty()) {
+                val targets = activeLampList()
+                val primary = targets.first()
+
+                val norm = (abs(gz) - deadzone).toFloat()
+                val accelStep = (norm.pow(1.15f) * 0.0020f * sensitivityMultiplier) * sign(gz.toFloat())
+
+                if (pressed) {
+                    // TRZYMANY GUZIK + OBRÓT = Temperatura barwowa (2700K - 6500K)
+                    rotatedDuringPress = true
+                    ui.removeCallbacks(longPressResolver)
+
+                    val newCt = (primary.ct + (accelStep * 38f).toInt()).coerceIn(2700, 6500)
+                    if (newCt != primary.ct) {
+                        targets.forEach { it.ct = newCt; it.nightMode = false; it.isOn = true }
+                        throttledNetworkPush(newCt, isCt = true, targets = targets)
+                    }
+                } else {
+                    // SAM OBRÓT = Jasność (1% - 100%)
+                    val newBright = (primary.bright + accelStep).coerceIn(1.0, 100.0)
+                    targets.forEach { it.bright = newBright; it.isOn = true }
+                    throttledNetworkPush(newBright.roundToInt(), isCt = false, targets = targets)
+                }
+            }
+
+            if (rxPacketCount % 8L == 0L || pressed) {
+                ui.post {
+                    hudView.updateImuTelemetry(ax / 16384f, ay / 16384f, az / 16384f, gz, pressed, upsideDownLatched)
+                    logBox.text = "[PKT #$rxPacketCount] BTN:${if (pressed) "1" else "0"} GZ:$gz AZ:$az\nHEX: $hex"
+                }
+            }
+        } else {
+            log("[PKT #$rxPacketCount] (${data.size}B) HEX: $hex")
+        }
+    }
+
+    // =========================================================================
+    // WYKRYWANIE I STEROWANIE YEELIGHT LAN
+    // =========================================================================
     private fun rebuildLampChips() {
         ui.post {
             chipContainer.removeAllViews()
             if (lamps.isEmpty()) {
                 val emptyChip = TextView(this).apply {
-                    text = "⚠️ Brak lamp w LAN (włącz LAN Control w apce Yeelight i kliknij 📡 LAN)"
+                    text = "⚠️ Brak lamp (włącz LAN Control w Yeelight i kliknij 📡 LAN)"
                     textSize = 12f
                     setTextColor(0xFFFFB703.toInt())
                     setPadding(12.dp, 8.dp, 12.dp, 8.dp)
@@ -287,7 +665,6 @@ class MainActivity : Activity() {
                 return@post
             }
 
-            // Kafelek dla każdej lampy + kafelek WSZYSTKIE na końcu
             val totalItems = lamps.size + 1
             if (selectedIdx >= totalItems) selectedIdx = 0
 
@@ -355,9 +732,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // =========================================================================
-    // PODWÓJNY SKANER YEELIGHT LAN (SSDP MULTICAST + TCP SUBNET SWEEP)
-    // =========================================================================
     private fun loadCachedLamps() {
         val cachedIps = prefs.getStringSet("known_ips", emptySet()) ?: emptySet()
         cachedIps.sorted().forEach { ip ->
@@ -373,10 +747,9 @@ class MainActivity : Activity() {
     }
 
     private fun scanLanForLamps() {
-        log("[LAN] Start hybrydowego skanowania (SSDP + TCP 55443)...")
+        log("[LAN] Skanowanie sieci (SSDP + TCP 55443)...")
         updateTopStatus()
 
-        // 1. Wątek SSDP Multicast
         netPool.execute {
             runCatching {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -404,15 +777,12 @@ class MainActivity : Activity() {
             }
         }
 
-        // 2. Wątek aktywnego skanowania podsieci po TCP 55443 (gdy router blokuje multicast)
         netPool.execute {
             val prefix = detectSubnetPrefix() ?: return@execute
             val sweepPool = Executors.newFixedThreadPool(32)
             for (host in 1..254) {
                 val testIp = "$prefix.$host"
-                sweepPool.execute {
-                    probeYeelightTcp(testIp)
-                }
+                sweepPool.execute { probeYeelightTcp(testIp) }
             }
             sweepPool.shutdown()
             sweepPool.awaitTermination(3, TimeUnit.SECONDS)
@@ -420,7 +790,6 @@ class MainActivity : Activity() {
                 saveKnownIps()
                 rebuildLampChips()
                 updateTopStatus()
-                log("[LAN] Skan zakończony. Aktywne lampy w puli: ${lamps.size}")
             }
         }
     }
@@ -523,233 +892,6 @@ class MainActivity : Activity() {
         return null
     }
 
-    // =========================================================================
-    // KOMUNIKACJA Z KAPSLEM TRIKI (BLE + PARSER RAMKI IMU + GESTY)
-    // =========================================================================
-    private fun toggleBleConnection() {
-        if (bleConnected) {
-            runCatching { gatt?.disconnect(); gatt?.close() }
-            bleConnected = false
-            updateTopStatus()
-            log("[BLE] Rozłączono ręcznie.")
-            return
-        }
-        startBleScan()
-    }
-
-    private fun startBleScan() {
-        val adapter = BluetoothAdapter.getDefaultAdapter()
-        if (adapter == null || !adapter.isEnabled) {
-            log("[BLE] Włącz Bluetooth w telefonie!")
-            return
-        }
-        val scanner = adapter.bluetoothLeScanner ?: return
-        if (scanningBle) return
-        scanningBle = true
-        log("[BLE] Szukam kapsla TRIKI... (kliknij 'Ż', aż mignie dioda)")
-        updateTopStatus()
-
-        val callback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val devName = result.device.name ?: result.scanRecord?.deviceName ?: ""
-                if (devName.contains("TRIKI", ignoreCase = true) || devName.contains("CAP", ignoreCase = true)) {
-                    scanningBle = false
-                    scanner.stopScan(this)
-                    log("[BLE] Namierzono $devName (${result.device.address}). Łączę...")
-                    gatt = result.device.connectGatt(this@MainActivity, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-                }
-            }
-        }
-        scanner.startScan(callback)
-        ui.postDelayed({
-            if (scanningBle) {
-                scanningBle = false
-                runCatching { scanner.stopScan(callback) }
-                updateTopStatus()
-                log("[BLE] Timeout skanowania. Wybudź kapsel kliknięciem i spróbuj ponownie.")
-            }
-        }, 8000)
-    }
-
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                bleConnected = true
-                gyroBiasZ = 0f
-                biasSamples = 0
-                updateTopStatus()
-                log("[BLE] Połączono z TRIKI! Odkrywam strumień IMU...")
-                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                g.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                bleConnected = false
-                updateTopStatus()
-                log("[BLE] Kapsel poszedł spać lub stracił zasięg.")
-            }
-        }
-
-        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            val nus = g.getService(uuidService)
-            if (nus != null) {
-                rxChar = nus.getCharacteristic(uuidRx)
-                nus.getCharacteristic(uuidTx)?.let { subscribeNotify(g, it) }
-                log("[BLE] Strumień IMU aktywny (High-Priority BLE). Kręć kapslem!")
-                pulseTrikiLed(2)
-                return
-            }
-            for (srv in g.services) {
-                for (c in srv.characteristics) {
-                    if ((c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) subscribeNotify(g, c)
-                    if ((c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) rxChar = c
-                }
-            }
-        }
-
-        @Deprecated("Deprecated in Java")
-        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-            val raw = c.value ?: return
-            processImuFrame(raw)
-        }
-    }
-
-    private fun subscribeNotify(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-        g.setCharacteristicNotification(c, true)
-        c.getDescriptor(uuidCccd)?.let {
-            it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            g.writeDescriptor(it)
-        }
-    }
-
-    private fun pulseTrikiLed(blinks: Int) {
-        val rx = rxChar ?: return
-        val g = gatt ?: return
-        netPool.execute {
-            repeat(blinks) {
-                runCatching {
-                    rx.value = byteArrayOf(0x01)
-                    g.writeCharacteristic(rx)
-                    Thread.sleep(90)
-                    rx.value = byteArrayOf(0x00)
-                    g.writeCharacteristic(rx)
-                    Thread.sleep(90)
-                }
-            }
-        }
-    }
-
-    // --- Logika wielokliku i długiego przytrzymania ---
-    private val clickResolver = Runnable {
-        if (clickCounter == 1) {
-            cycleTargetLamp()
-        } else if (clickCounter >= 2) {
-            toggleActivePower()
-        }
-        clickCounter = 0
-    }
-
-    private val longPressResolver = Runnable {
-        if (btnPressed && !rotatedDuringPress) {
-            longPressFired = true
-            hudView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-            toggleActiveNightMode()
-        }
-    }
-
-    private fun handleButtonEdge(pressed: Boolean) {
-        if (pressed && !btnPressed) {
-            rotatedDuringPress = false
-            longPressFired = false
-            ui.postDelayed(longPressResolver, 650)
-        } else if (!pressed && btnPressed) {
-            ui.removeCallbacks(longPressResolver)
-            if (!rotatedDuringPress && !longPressFired) {
-                clickCounter++
-                ui.removeCallbacks(clickResolver)
-                ui.postDelayed(clickResolver, 280)
-            }
-        }
-        btnPressed = pressed
-    }
-
-    private fun processImuFrame(data: ByteArray) {
-        if (data.size == 1) {
-            handleButtonEdge((data[0].toInt() and 0x01) == 1)
-            return
-        }
-        if (data.size < 12) return
-
-        val offset = if (data[0] == 0x22.toByte() && data.size >= 14) 1 else 0
-        val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-
-        val gx = buf.getShort(offset).toInt()
-        val gy = buf.getShort(offset + 2).toInt()
-        val gzRaw = buf.getShort(offset + 4).toInt()
-        val ax = buf.getShort(offset + 6).toInt()
-        val ay = buf.getShort(offset + 8).toInt()
-        val az = buf.getShort(offset + 10).toInt()
-
-        val pressed = if (data.size > offset + 12) (data.last().toInt() and 0x01) == 1 else btnPressed
-        handleButtonEdge(pressed)
-
-        // Autokalibracja dryfu żyroskopu w spoczynku
-        if (abs(gzRaw) < 90 && abs(gx) < 90 && abs(gy) < 90 && biasSamples < 60) {
-            gyroBiasZ = (gyroBiasZ * biasSamples + gzRaw) / (biasSamples + 1)
-            biasSamples++
-        }
-        val gz = (gzRaw - gyroBiasZ).toInt()
-
-        // 1. Detekcja odwrócenia kapsla na plecy -> Wyłącz wszystkie lampy w domu
-        val now = SystemClock.elapsedRealtime()
-        if (az < -11500) {
-            if (!upsideDownLatched && now - lastFlipTs > 2500) {
-                upsideDownLatched = true
-                lastFlipTs = now
-                ui.post {
-                    hudView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                    killAllLamps()
-                }
-            }
-        } else if (az > 7500) {
-            upsideDownLatched = false
-        }
-
-        // 2. Obrót w osi Z (z nieliniową akceleracją i martwą strefą)
-        val deadzone = 150
-        if (abs(gz) > deadzone && lamps.isNotEmpty()) {
-            val targets = activeLampList()
-            val primary = targets.first()
-
-            // Krzywa czułości: precyzyjnie przy wolnym ruchu, szybko przy mocnym zakręceniu
-            val norm = (abs(gz) - deadzone).toFloat()
-            val accelStep = (norm.pow(1.18f) * 0.0018f * sensitivityMultiplier) * sign(gz.toFloat())
-
-            if (pressed) {
-                // TRZYMANY GUZIK + OBRÓT = Temperatura bieli (2700K - 6500K)
-                rotatedDuringPress = true
-                ui.removeCallbacks(longPressResolver)
-
-                val newCt = (primary.ct + (accelStep * 38f).toInt()).coerceIn(2700, 6500)
-                if (newCt != primary.ct) {
-                    targets.forEach { it.ct = newCt; it.nightMode = false; it.isOn = true }
-                    throttledNetworkPush(newCt, isCt = true, targets = targets)
-                }
-            } else {
-                // SAM OBRÓT = Jasność (1% - 100%)
-                val newBright = (primary.bright + accelStep).coerceIn(1.0, 100.0)
-                targets.forEach { it.bright = newBright; it.isOn = true }
-                throttledNetworkPush(newBright.roundToInt(), isCt = false, targets = targets)
-            }
-        }
-
-        // Aktualizacja telemetrii 3D na tarczy HUD
-        ui.post {
-            hudView.updateImuTelemetry(ax / 16384f, ay / 16384f, az / 16384f, gz, pressed, upsideDownLatched)
-        }
-    }
-
-    // =========================================================================
-    // STEROWANIE YEELIGHT (KOMENDY RPC PO TCP 55443)
-    // =========================================================================
     private fun activeLampList(): List<LampNode> {
         if (lamps.isEmpty()) return emptyList()
         return if (selectedIdx >= lamps.size) lamps else listOf(lamps[selectedIdx])
@@ -761,7 +903,7 @@ class MainActivity : Activity() {
         lastSentVal = -1
         hudView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
         rebuildLampChips()
-        pulseTrikiLed(if (selectedIdx == lamps.size) 5 else selectedIdx + 1)
+        pulseTrikiLed(if (selectedIdx == lamps.size) 4 else selectedIdx + 1)
     }
 
     private fun applyManualDialChange(newBright: Double, newCt: Int, isCtEdit: Boolean) {
@@ -808,7 +950,7 @@ class MainActivity : Activity() {
             sendYeelightRpc(it.ip, "set_power", "[\"${if (turnOn) "on" else "off"}\",\"smooth\",250]")
         }
         syncHudWithSelection()
-        log("[CMD] Przełączono zasilanie -> ${if (turnOn) "ON" else "OFF"}")
+        log("[CMD] Zasilanie -> ${if (turnOn) "ON" else "OFF"}")
     }
 
     private fun toggleActiveNightMode() {
@@ -849,7 +991,7 @@ class MainActivity : Activity() {
             sendYeelightRpc(it.ip, "set_power", "[\"off\",\"smooth\",300]")
         }
         syncHudWithSelection()
-        log("[KILLSWITCH] Kapsel na plecach -> Wyłączono wszystkie lampy w domu!")
+        log("[KILLSWITCH] Kapsel na plecach -> Wyłączono wszystkie lampy!")
     }
 
     private fun sendYeelightRpc(ip: String, method: String, paramsJson: String) {
@@ -885,7 +1027,7 @@ class MainActivity : Activity() {
                 scanningBle -> "🟡 SZUKAM TRIKI..."
                 else -> "⚪ BLE ROZŁĄCZONY"
             }
-            statusBadge.text = "$bleStr  •  💡 LAMPY W SIECI: ${lamps.size}"
+            statusBadge.text = "$bleStr  •  💡 LAMPY: ${lamps.size}"
         }
     }
 
@@ -990,7 +1132,6 @@ class MainActivity : Activity() {
                 else -> 0xFF00F5D4.toInt()
             }
 
-            // 1. Tło tarczy i podziałka (Ticks)
             val tickCount = 40
             paintTrack.strokeWidth = 4f
             for (i in 0..tickCount) {
@@ -1008,7 +1149,6 @@ class MainActivity : Activity() {
                 )
             }
 
-            // 2. Zewnętrzny łuk: Jasność (1% - 100%)
             paintTrack.strokeWidth = radius * 0.11f
             paintTrack.color = 0xFF141B26.toInt()
             canvas.drawArc(arcRect, 135f, 270f, false, paintTrack)
@@ -1018,7 +1158,6 @@ class MainActivity : Activity() {
             paintActive.color = mainAccent
             canvas.drawArc(arcRect, 135f, sweepBright, false, paintActive)
 
-            // 3. Wewnętrzny łuk: Temperatura bieli (2700K - 6500K)
             paintTrack.strokeWidth = radius * 0.055f
             paintTrack.color = 0xFF111722.toInt()
             canvas.drawArc(innerArcRect, 135f, 270f, false, paintTrack)
@@ -1029,7 +1168,6 @@ class MainActivity : Activity() {
             paintActive.color = if (isNight) 0xFF7B2CBF.toInt() else ctColor
             canvas.drawArc(innerArcRect, 135f, ctNorm * 270f, false, paintActive)
 
-            // 4. Środkowy celownik 3D IMU (pokazuje przechył kapsla na żywo)
             val coreR = radius * 0.56f
             paintFill.color = if (puckPressed) 0xFF19283A.toInt() else 0xFF0E141D.toInt()
             canvas.drawCircle(cx, cy, coreR, paintFill)
@@ -1038,7 +1176,6 @@ class MainActivity : Activity() {
             paintTrack.color = if (puckPressed) 0xFFFFBE0B.toInt() else 0xFF223042.toInt()
             canvas.drawCircle(cx, cy, coreR, paintTrack)
 
-            // Kropka wektora grawitacji X/Y kapsla
             val dotX = (cx + (imuAx.coerceIn(-1f, 1f) * coreR * 0.45f))
             val dotY = (cy + (imuAy.coerceIn(-1f, 1f) * coreR * 0.45f))
             paintFill.color = 0x3300F5D4
@@ -1046,7 +1183,6 @@ class MainActivity : Activity() {
             paintFill.color = if (puckFlipped) 0xFFFF0055.toInt() else 0xFF00BBF9.toInt()
             canvas.drawCircle(dotX, dotY, 7f, paintFill)
 
-            // 5. Główne napisy wewnątrz tarczy
             paintText.color = 0xFF8A99AD.toInt()
             paintText.textSize = radius * 0.095f
             canvas.drawText(lampTitle.uppercase(), cx, cy - coreR * 0.45f, paintText)
@@ -1072,7 +1208,6 @@ class MainActivity : Activity() {
         }
 
         private fun interpolateCtColor(t: Float): Int {
-            // Od ciepłego bursztynu (2700K) do lodowego błękitu (6500K)
             val r = (255 - t * 65).toInt().coerceIn(0, 255)
             val g = (175 + t * 65).toInt().coerceIn(0, 255)
             val b = (75 + t * 180).toInt().coerceIn(0, 255)
@@ -1115,7 +1250,6 @@ class MainActivity : Activity() {
                         if (delta < -180f) delta += 360f
                         lastTouchAngle = curAngle
 
-                        // Wewnętrzny pierścień steruje barwą CT, zewnętrzny jasnością
                         val editingCt = dist < radius * 0.85f
                         if (editingCt) {
                             colorTemp = (colorTemp + (delta * 16f).toInt()).coerceIn(2700, 6500)
